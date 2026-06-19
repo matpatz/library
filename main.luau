@@ -1,26 +1,68 @@
+--[[
+    UI Library Wrapper
+    -------------------
+    Lets a script target one consistent API (CreateWindow, CreateTab,
+    CreateButton, ...) while the actual backend (Rayfield, Kavo, etc.)
+    is swapped underneath. Supports per-method name aliasing so a
+    script can call e.g. `tabs.main:MakeButton(...)` instead of
+    `tabs.main:CreateButton(...)`, without losing the original name.
+
+    Usage:
+
+        local Library = loadstring(game:HttpGet(
+            "https://raw.githubusercontent.com/matpatz/library/refs/heads/main/main.luau"
+        ))()
+
+        local Rayfield = Library:CreateLibrary("Rayfield", {
+            CreateButton = "MakeButton", -- adds MakeButton as an alias of CreateButton
+        })
+
+        local Window = Rayfield:CreateWindow({
+            Name = "Important Question",
+            LoadingTitle = "fah you",
+            LoadingSubtitle = "subtitle",
+        })
+
+        local tabs = {
+            main = Window:CreateTab("Main", 4483362458),
+        }
+
+        tabs.main:CreateLabel("Why is Lebron james the goat")
+
+        tabs.main:MakeButton({
+            Name = "He just is",
+            Callback = function() end,
+        })
+
+        Library:SetLibrary("Kavo")
+]]
+
 local Services = loadstring(game:HttpGet(
     "https://website-iota-ivory-12.vercel.app/code/loader/u/vars.lua"
 ))()
 
 local States = {
-    SelectedLibrary = nil,
-    SelectedLibraryName = nil,
-    ActiveWindow = nil,
+    SelectedLibrary = nil,     -- the raw backend object/table (e.g. Rayfield's module)
+    SelectedLibraryName = nil, -- "Rayfield" / "Kavo" / ...
 }
 
 local Values = {
     Flags = {},
-    Tabs = {},
 }
 
 local Helpers = {}
 local Mappings = {}
 local Builders = {}
+local Aliases = {}
 
 local Library = {
     Services = Services,
     Values = Values,
 }
+
+--------------------------------------------------------------------------
+-- Helpers
+--------------------------------------------------------------------------
 
 function Helpers.Notify(Title, Text, Duration)
     Services.StarterGui:SetCore("SendNotification", {
@@ -40,18 +82,98 @@ function Helpers.LibraryLoaded(Message)
     return false
 end
 
-function Helpers.Call(Object, Method, ...)
-    local MethodName = Mappings[States.SelectedLibraryName][Method]
-    local Builder = Builders[States.SelectedLibraryName][Method]
+-- Resolves an alias (e.g. "MakeButton") back to its canonical method
+-- name (e.g. "CreateButton"). Returns the input unchanged if it's not
+-- an alias, since canonical names always remain valid.
+function Helpers.ResolveAlias(LibraryName, MethodName)
+    local LibraryAliases = Aliases[LibraryName]
 
-    local Arguments = Builder(...)
-
-    if type(Arguments) == "table" and not Arguments[1] then
-        return Object[MethodName](Object, Arguments)
+    if LibraryAliases and LibraryAliases[MethodName] then
+        return LibraryAliases[MethodName]
     end
 
-    return Object[MethodName](Object, Arguments)
+    return MethodName
 end
+
+-- Builds the backend-specific arguments for a canonical method and
+-- invokes it on the given raw backend object.
+--
+-- Builders can return either:
+--   (a) a single config table (e.g. Rayfield's CreateButton), or
+--   (b) multiple positional values (e.g. Kavo's CreateButton).
+-- Both shapes are supported: positional returns are packed and
+-- splatted as separate arguments to the backend method.
+function Helpers.Call(Object, Method, ...)
+    local LibraryName = States.SelectedLibraryName
+    local CanonicalMethod = Helpers.ResolveAlias(LibraryName, Method)
+
+    local MethodName = Mappings[LibraryName][CanonicalMethod]
+    local Builder = Builders[LibraryName][CanonicalMethod]
+
+    if not MethodName or not Builder then
+        Helpers.Notify(
+            "Error",
+            ("Method '%s' is not supported by %s"):format(
+                CanonicalMethod,
+                LibraryName
+            ),
+            5
+        )
+        return nil
+    end
+
+    local PackedArguments = table.pack(Builder(...))
+
+    -- Single config-table return: pass it through as-is.
+    if PackedArguments.n == 1 and type(PackedArguments[1]) == "table" then
+        return Object[MethodName](Object, PackedArguments[1])
+    end
+
+    -- Multiple positional return values: splat them all.
+    return Object[MethodName](Object, table.unpack(PackedArguments, 1, PackedArguments.n))
+end
+
+-- Wraps a raw backend object (a window, tab, or section returned by
+-- the backend library) in a proxy whose __index dispatches method
+-- calls through Helpers.Call, resolving aliases first. This is what
+-- lets `tabs.main:CreateLabel(...)` and `tabs.main:MakeButton(...)`
+-- both work on the same object.
+function Helpers.Wrap(RawObject)
+    if RawObject == nil then
+        return nil
+    end
+
+    local Proxy = { __raw = RawObject }
+
+    setmetatable(Proxy, {
+        __index = function(_, Key)
+            -- Allow direct passthrough access to non-wrapped fields
+            -- on the raw object (e.g. RawObject.SomeProperty).
+            if RawObject[Key] ~= nil and type(RawObject[Key]) ~= "function" then
+                return RawObject[Key]
+            end
+
+            return function(_, ...)
+                local Result = Helpers.Call(RawObject, Key, ...)
+
+                -- If the backend returned a child UI element (a new
+                -- tab, section, etc.) wrap it too so chained calls
+                -- keep working the same way.
+                if type(Result) == "table" then
+                    return Helpers.Wrap(Result)
+                end
+
+                return Result
+            end
+        end,
+    })
+
+    return Proxy
+end
+
+--------------------------------------------------------------------------
+-- Mappings: canonical method name -> backend's real method name
+--------------------------------------------------------------------------
 
 Mappings = {
     Rayfield = {
@@ -88,29 +210,29 @@ Mappings = {
     },
 }
 
+--------------------------------------------------------------------------
+-- Builders: canonical method args -> backend-specific call shape
+--------------------------------------------------------------------------
+
 Builders = {
     Rayfield = {
-        CreateWindow = function(Name, Title, Subtitle, Config)
-            return {
-                Name = Name,
-                LoadingTitle = Title,
-                LoadingSubtitle = Subtitle,
+        -- Accepts a single config table, matching Rayfield's real API
+        -- and the wrapper's intended usage:
+        --   Rayfield:CreateWindow({ Name = ..., LoadingTitle = ..., ... })
+        CreateWindow = function(Config)
+            Config = Config or {}
 
-                ConfigurationSaving = Config
-                    and Config.ConfigurationSaving
+            return {
+                Name = Config.Name,
+                LoadingTitle = Config.LoadingTitle,
+                LoadingSubtitle = Config.LoadingSubtitle,
+
+                ConfigurationSaving = Config.ConfigurationSaving
                     or { Enabled = false },
 
-                Theme = Config
-                    and Config.Theme
-                    or "Default",
-
-                Icon = Config
-                    and Config.Icon
-                    or 0,
-
-                ToggleUIKeybind = Config
-                    and Config.ToggleUIKeybind
-                    or "K",
+                Theme = Config.Theme or "Default",
+                Icon = Config.Icon or 0,
+                ToggleUIKeybind = Config.ToggleUIKeybind or "K",
             }
         end,
 
@@ -122,93 +244,80 @@ Builders = {
             return Name
         end,
 
-        CreateButton = function(Name, Description, Callback)
+        CreateDivider = function()
+            return nil
+        end,
+
+        CreateButton = function(Config)
+            Config = Config or {}
+
             return {
-                Name = Name,
-                Info = Description,
-                Callback = Callback,
+                Name = Config.Name,
+                Info = Config.Description,
+                Callback = Config.Callback,
             }
         end,
 
-        CreateToggle = function(Name, Default, Flag, Callback)
+        CreateToggle = function(Config)
+            Config = Config or {}
+
             return {
-                Name = Name,
-                CurrentValue = Default,
-                Flag = Flag,
-                Callback = Callback,
+                Name = Config.Name,
+                CurrentValue = Config.Default,
+                Flag = Config.Flag,
+                Callback = Config.Callback,
             }
         end,
 
-        CreateSlider = function(
-            Name,
-            Min,
-            Max,
-            Increment,
-            Default,
-            Suffix,
-            Flag,
-            Callback
-        )
+        CreateSlider = function(Config)
+            Config = Config or {}
+
             return {
-                Name = Name,
-                Range = { Min, Max },
-                Increment = Increment,
-                CurrentValue = Default,
-                Suffix = Suffix,
-                Flag = Flag,
-                Callback = Callback,
+                Name = Config.Name,
+                Range = { Config.Min, Config.Max },
+                Increment = Config.Increment,
+                CurrentValue = Config.Default,
+                Suffix = Config.Suffix,
+                Flag = Config.Flag,
+                Callback = Config.Callback,
             }
         end,
 
-        CreateInput = function(
-            Name,
-            Placeholder,
-            Default,
-            Flag,
-            RemoveAfter,
-            Callback
-        )
+        CreateInput = function(Config)
+            Config = Config or {}
+
             return {
-                Name = Name,
-                PlaceholderText = Placeholder,
-                CurrentValue = Default,
-                Flag = Flag,
-                RemoveTextAfterFocusLost = RemoveAfter,
-                Callback = Callback,
+                Name = Config.Name,
+                PlaceholderText = Config.Placeholder,
+                CurrentValue = Config.Default,
+                Flag = Config.Flag,
+                RemoveTextAfterFocusLost = Config.RemoveAfter,
+                Callback = Config.Callback,
             }
         end,
 
-        CreateDropdown = function(
-            Name,
-            Options,
-            Default,
-            Multi,
-            Flag,
-            Callback
-        )
+        CreateDropdown = function(Config)
+            Config = Config or {}
+
             return {
-                Name = Name,
-                Options = Options,
-                CurrentOption = Default,
-                MultipleOptions = Multi,
-                Flag = Flag,
-                Callback = Callback,
+                Name = Config.Name,
+                Options = Config.Options,
+                CurrentOption = Config.Default,
+                MultipleOptions = Config.Multi,
+                Flag = Config.Flag,
+                Callback = Config.Callback,
             }
         end,
 
-        CreateKeybind = function(
-            Name,
-            Default,
-            Hold,
-            Flag,
-            Callback
-        )
+        CreateKeybind = function(Config)
+            Config = Config or {}
+
             return {
-                Name = Name,
-                CurrentKeybind = Default,
-                HoldToInteract = Hold,
-                Flag = Flag,
-                Callback = Callback,
+                Name = Config.Name,
+                CurrentKeybind = Config.Default,
+                HoldToInteract = Config.Hold,
+                Flag = Config.Flag,
+                Callback = Config.Callback,
             }
         end,
 
@@ -216,38 +325,47 @@ Builders = {
             return Text, Icon, Color, IgnoreTheme
         end,
 
-        CreateParagraph = function(Title, Content)
+        CreateParagraph = function(Config)
+            Config = Config or {}
+
             return {
-                Title = Title,
-                Content = Content,
+                Title = Config.Title,
+                Content = Config.Content,
             }
         end,
 
-        CreateColorPicker = function(Name, Default, Flag, Callback)
+        CreateColorPicker = function(Config)
+            Config = Config or {}
+
             return {
-                Name = Name,
-                Color = Default,
-                Flag = Flag,
-                Callback = Callback,
+                Name = Config.Name,
+                Color = Config.Default,
+                Flag = Config.Flag,
+                Callback = Config.Callback,
             }
         end,
 
-        Notify = function(Title, Content, Duration, Image)
+        Notify = function(Config)
+            Config = Config or {}
+
             return {
-                Title = Title,
-                Content = Content,
-                Duration = Duration,
-                Image = Image,
+                Title = Config.Title,
+                Content = Config.Content,
+                Duration = Config.Duration,
+                Image = Config.Image,
             }
+        end,
+
+        Destroy = function()
+            return nil
         end,
     },
 
     Kavo = {
-        CreateWindow = function(Name, _, _, Config)
-            return Name,
-                Config
-                and Config.Theme
-                or "Dark Blue"
+        CreateWindow = function(Config)
+            Config = Config or {}
+
+            return Config.Name, Config.Theme or "Dark Blue"
         end,
 
         CreateTab = function(Name, Icon)
@@ -258,56 +376,75 @@ Builders = {
             return Name
         end,
 
-        CreateButton = function(Name, _, Callback)
-            return Name, Callback
+        CreateButton = function(Config)
+            Config = Config or {}
+
+            return Config.Name, Config.Callback
         end,
 
-        CreateToggle = function(Name, Default, Flag, Callback)
-            return Name, Flag, Default, Callback
+        CreateToggle = function(Config)
+            Config = Config or {}
+
+            return Config.Name, Config.Flag, Config.Default, Config.Callback
         end,
 
-        CreateSlider = function(
-            Name,
-            Min,
-            Max,
-            Increment,
-            Default,
-            _,
-            Flag,
-            Callback
-        )
-            return Name,
-                Min,
-                Max,
-                Increment,
-                Default,
-                Flag,
-                Callback
+        CreateSlider = function(Config)
+            Config = Config or {}
+
+            return Config.Name,
+                Config.Min,
+                Config.Max,
+                Config.Increment,
+                Config.Default,
+                Config.Flag,
+                Config.Callback
         end,
 
-        CreateInput = function(Name, _, _, Flag, _, Callback)
-            return Name, Flag, Callback
+        CreateInput = function(Config)
+            Config = Config or {}
+
+            return Config.Name, Config.Flag, Config.Callback
         end,
 
-        CreateDropdown = function(Name, Options, _, _, Flag, Callback)
-            return Name, Options, Flag, Callback
+        CreateDropdown = function(Config)
+            Config = Config or {}
+
+            return Config.Name, Config.Options, Config.Flag, Config.Callback
         end,
 
-        CreateKeybind = function(Name, Default, _, Flag, Callback)
-            return Name, Default, Flag, Callback
+        CreateKeybind = function(Config)
+            Config = Config or {}
+
+            return Config.Name, Config.Default, Config.Flag, Config.Callback
         end,
 
         CreateLabel = function(Text)
             return Text
         end,
 
-        Notify = function(Title, Content, Duration)
-            return Title, Content, Duration
+        Notify = function(Config)
+            Config = Config or {}
+
+            return Config.Title, Config.Content, Config.Duration
+        end,
+
+        Destroy = function()
+            return nil
         end,
     },
 }
 
-function Library:CreateLibrary(Selected, Config)
+--------------------------------------------------------------------------
+-- Public API
+--------------------------------------------------------------------------
+
+-- Selects a backend library and optionally registers method aliases.
+--
+-- AliasConfig maps NewName -> CanonicalName, e.g.
+--   { CreateButton = "MakeButton" }
+-- registers "MakeButton" as an additional way to call "CreateButton".
+-- The canonical name keeps working too.
+function Library:CreateLibrary(Selected, AliasConfig)
     if not Mappings[Selected] then
         Helpers.Notify(
             "Error",
@@ -322,142 +459,68 @@ function Library:CreateLibrary(Selected, Config)
     States.SelectedLibrary = Services[Selected:lower()]
         or _G[Selected]
 
-    if Config then
-        for YourName, LibraryName in pairs(Config) do
-            Mappings[Selected][YourName] = LibraryName
+    Aliases[Selected] = Aliases[Selected] or {}
+
+    if AliasConfig then
+        for CanonicalName, AliasName in pairs(AliasConfig) do
+            if Mappings[Selected][CanonicalName] then
+                Aliases[Selected][AliasName] = CanonicalName
+            else
+                Helpers.Notify(
+                    "Error",
+                    ("Cannot alias unknown method '%s'"):format(
+                        CanonicalName
+                    ),
+                    5
+                )
+            end
         end
     end
 
     return self
 end
 
-function Library:CreateWindow(Name, Title, Subtitle, Config)
+-- Swaps the active backend library while keeping previously registered
+-- alias configs for that library name intact. Note: this only affects
+-- objects created *after* the switch — windows/tabs already built are
+-- bound to the previous backend.
+function Library:SetLibrary(Selected)
+    if not Mappings[Selected] then
+        Helpers.Notify(
+            "Error",
+            "Selected Library is not available",
+            5
+        )
+
+        return nil
+    end
+
+    States.SelectedLibraryName = Selected
+    States.SelectedLibrary = Services[Selected:lower()]
+        or _G[Selected]
+
+    Aliases[Selected] = Aliases[Selected] or {}
+
+    return self
+end
+
+function Library:CreateWindow(Config)
     if not Helpers.LibraryLoaded(
         "Attempt to create Window without Library"
     ) then
         return
     end
 
-    States.ActiveWindow = Helpers.Call(
+    local RawWindow = Helpers.Call(
         States.SelectedLibrary,
         "CreateWindow",
-        Name,
-        Title,
-        Subtitle,
         Config
     )
 
-    return States.ActiveWindow
+    return Helpers.Wrap(RawWindow)
 end
 
-function Library:CreateTab(Name, Icon)
-    if not Helpers.LibraryLoaded(
-        "Attempt to create Tab without Library"
-    ) then
-        return
-    end
-
-    local Tab = Helpers.Call(
-        States.ActiveWindow,
-        "CreateTab",
-        Name,
-        Icon
-    )
-
-    Values.Tabs[Name] = Tab
-
-    return Tab
-end
-
-function Library:CreateSection(Tab, Name)
-    if not Helpers.LibraryLoaded(
-        "Attempt to create Section without Library"
-    ) then
-        return
-    end
-
-    return Helpers.Call(Tab, "CreateSection", Name)
-end
-
-function Library:CreateDivider(Tab)
-    if not Helpers.LibraryLoaded(
-        "Attempt to create Divider without Library"
-    ) then
-        return
-    end
-
-    return Helpers.Call(Tab, "CreateDivider")
-end
-
-function Library:CreateButton(Tab, Name, Description, Callback)
-    if not Helpers.LibraryLoaded(
-        "Attempt to create Button without Library"
-    ) then
-        return
-    end
-
-    return Helpers.Call(
-        Tab,
-        "CreateButton",
-        Name,
-        Description,
-        Callback
-    )
-end
-
-function Library:CreateToggle(Tab, Name, Default, Flag, Callback)
-    if not Helpers.LibraryLoaded(
-        "Attempt to create Toggle without Library"
-    ) then
-        return
-    end
-
-    Values.Flags[Flag] = Default
-
-    return Helpers.Call(
-        Tab,
-        "CreateToggle",
-        Name,
-        Default,
-        Flag,
-        Callback
-    )
-end
-
-function Library:CreateSlider(
-    Tab,
-    Name,
-    Min,
-    Max,
-    Increment,
-    Default,
-    Suffix,
-    Flag,
-    Callback
-)
-    if not Helpers.LibraryLoaded(
-        "Attempt to create Slider without Library"
-    ) then
-        return
-    end
-
-    Values.Flags[Flag] = Default
-
-    return Helpers.Call(
-        Tab,
-        "CreateSlider",
-        Name,
-        Min,
-        Max,
-        Increment,
-        Default,
-        Suffix,
-        Flag,
-        Callback
-    )
-end
-
-function Library:Notify(Title, Content, Duration, Image)
+function Library:Notify(Config)
     if not Helpers.LibraryLoaded(
         "Attempt to notify without Library"
     ) then
@@ -467,10 +530,7 @@ function Library:Notify(Title, Content, Duration, Image)
     return Helpers.Call(
         States.SelectedLibrary,
         "Notify",
-        Title,
-        Content,
-        Duration,
-        Image
+        Config
     )
 end
 
@@ -488,10 +548,8 @@ function Library:Destroy()
 
     States.SelectedLibrary = nil
     States.SelectedLibraryName = nil
-    States.ActiveWindow = nil
 
     table.clear(Values.Flags)
-    table.clear(Values.Tabs)
 end
 
 return Library
