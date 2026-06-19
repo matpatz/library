@@ -7,34 +7,7 @@
     script can call e.g. `tabs.main:MakeButton(...)` instead of
     `tabs.main:CreateButton(...)`, without losing the original name.
 
-    Usage:
-
-        local Library = loadstring(game:HttpGet(
-            "https://raw.githubusercontent.com/matpatz/library/refs/heads/main/main.luau"
-        ))()
-
-        local Rayfield = Library:CreateLibrary("Rayfield", {
-            CreateButton = "MakeButton", -- adds MakeButton as an alias of CreateButton
-        })
-
-        local Window = Rayfield:CreateWindow({
-            Name = "Important Question",
-            LoadingTitle = "fah you",
-            LoadingSubtitle = "subtitle",
-        })
-
-        local tabs = {
-            main = Window:CreateTab("Main", 4483362458),
-        }
-
-        tabs.main:CreateLabel("Why is Lebron james the goat")
-
-        tabs.main:MakeButton({
-            Name = "He just is",
-            Callback = function() end,
-        })
-
-        Library:SetLibrary("Kavo")
+    Usage: https://github.com/matpatz/library/blob/main/usage.luau
 ]]
 
 local Services = loadstring(game:HttpGet(
